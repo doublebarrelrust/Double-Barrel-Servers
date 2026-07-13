@@ -1,0 +1,97 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    html, body { margin: 0; background: transparent; overflow: hidden; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/vendor/build/three.module.js",
+    "three/addons/": "/vendor/examples/jsm/"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+
+// Renders one base: the server hands us a list of models with their world transforms,
+// we assemble them, frame the camera on the result and signal that we're done. Puppeteer
+// then screenshots the canvas.
+const jobId = new URLSearchParams(location.search).get('job');
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+renderer.setSize(900, 600);
+renderer.setClearColor(0x000000, 0); // transparent - the card's panel shows through
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+
+// Studio-ish lighting: soft sky fill plus a key light for readable edges.
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x2a2622, 2.2));
+const key = new THREE.DirectionalLight(0xffffff, 2.4);
+key.position.set(1, 2, 1.4);
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x9fb6ff, 0.7);
+rim.position.set(-1.5, 0.8, -1.2);
+scene.add(rim);
+
+const draco = new DRACOLoader().setDecoderPath('/vendor/examples/jsm/libs/draco/');
+const loader = new GLTFLoader().setDRACOLoader(draco);
+
+const load = (url) => new Promise((resolve) => {
+  loader.load(url, (gltf) => resolve(gltf.scene), undefined, (err) => {
+    console.log('load failed: ' + url + ' :: ' + err.message);
+    resolve(null);
+  });
+});
+
+(async () => {
+  const { pieces } = await (await fetch(`/job/${jobId}`)).json();
+
+  // Same model reused many times: load each URL once, then clone.
+  const cache = new Map();
+  const root = new THREE.Group();
+
+  for (const piece of pieces) {
+    if (!cache.has(piece.url)) cache.set(piece.url, await load(piece.url));
+    const template = cache.get(piece.url);
+    if (!template) continue;
+
+    const model = template.clone(true);
+    model.position.set(piece.pos[0], piece.pos[1], piece.pos[2]);
+    model.rotation.set(
+      THREE.MathUtils.degToRad(piece.rot[0]),
+      THREE.MathUtils.degToRad(piece.rot[1]),
+      THREE.MathUtils.degToRad(piece.rot[2]),
+    );
+    root.add(model);
+  }
+
+  scene.add(root);
+
+  // Frame the whole base from a fixed 3/4 angle, like the reference cards.
+  const box = new THREE.Box3().setFromObject(root);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const radius = Math.max(size.length() * 0.5, 4);
+
+  const camera = new THREE.PerspectiveCamera(35, 900 / 600, 0.1, 5000);
+  const dir = new THREE.Vector3(1, 0.72, 1).normalize();
+  camera.position.copy(center).addScaledVector(dir, radius * 2.6);
+  camera.lookAt(center);
+  camera.updateProjectionMatrix();
+
+  renderer.render(scene, camera);
+  window.__renderDone = true;
+})();
+</script>
+</body>
+</html>

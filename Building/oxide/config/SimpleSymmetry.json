@@ -1,0 +1,16 @@
+{
+  "DefaultButtonColor": "0 0 0 .7",
+  "MainBackgroundColor": "0 0 0 .8",
+  "OffsetMax": "-5 -5",
+  "OffsetMin": "-245 -140",
+  "SelectedButtonColor": "0 .45 1 .7",
+  "ShowUIByDefault": false,
+  "UiAnchorMax": "1 1",
+  "UiAnchorMin": "1 1",
+  "EnableEntKill": false,
+  "Max Radius For Building": 300.0,
+  "ShowChatMessages": true,
+  "SupportRemoverTool": true,
+  "ToggleUiWithPlanner": true,
+  "RequireMaterialsToBuild": false
+}

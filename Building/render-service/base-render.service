@@ -1,0 +1,21 @@
+[Unit]
+Description=Rust base render service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/base-render
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+
+# --- edit these two ---
+Environment=PUBLIC_URL=http://VPS_IP:8080
+Environment=API_KEY=your-secret-here
+# ----------------------
+
+Environment=PORT=8080
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
