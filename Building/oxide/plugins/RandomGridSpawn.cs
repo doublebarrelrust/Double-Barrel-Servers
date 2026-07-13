@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Libraries;
@@ -10,7 +11,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("RandomGridSpawn", "Codex", "3.63.0")]
+    [Info("RandomGridSpawn", "Codex", "3.64.0")]
     [Description("Assigns each player a random 2x2 grid area and keeps them inside it.")]
     class RandomGridSpawn : RustPlugin
     {
@@ -2132,11 +2133,13 @@ namespace Oxide.Plugins
             MenuButton(container, card, 12, -218, 110, 30, "UNDO", "gridspawn.menu undo");
             MenuButton(container, card, 130, -218, 110, 30, "REDO", "gridspawn.menu redo");
             MenuButton(container, card, 248, -218, 110, 30, "QUICK SAVE", "gridspawn.menu quicksave", "0.29 0.48 0.17 1");
+            MenuButton(container, card, 12, -256, 173, 30, "PLOT ACTIONS", "gridspawn.plot open", "0.29 0.41 1 0.9");
+            MenuButton(container, card, 191, -256, 167, 30, "FARMING", "gridspawn.farm open", "0.29 0.48 0.17 1");
 
             container.Add(new CuiLabel
             {
                 Text = { Text = "MLRS rains real rockets on your plot. Infinite ammo refills any magazine.\nUndo/redo covers your placements, deletes and tier changes - bind a key\nwith:  bind z gridspawn.undo   and   bind x gridspawn.redo", FontSize = 10, Font = "robotocondensed-regular.ttf", Align = TextAnchor.UpperLeft, Color = "1 1 1 0.5" },
-                RectTransform = { AnchorMin = "0 1", AnchorMax = "1 1", OffsetMin = "12 -300", OffsetMax = "-12 -252" }
+                RectTransform = { AnchorMin = "0 1", AnchorMax = "1 1", OffsetMin = "12 -340", OffsetMax = "-12 -294" }
             }, card);
         }
 
@@ -7003,5 +7006,668 @@ namespace Oxide.Plugins
 
             return label;
         }
+
+        #region Plot Actions & Farming panels
+
+        // Two admin panels that act on the plot the player OWNS (assignedAreas[userID]).
+        // Buttons route through the gridspawn.plot / gridspawn.farm console commands and
+        // reuse the plugin's existing MenuButton/IsInsideArea/GetGroundedPosition/QuickSave
+        // helpers so the styling and plot resolution match the rest of the menu.
+        //
+        // Structural safety: everything whose exact Rust API can shift between game updates
+        // (plant growth/water/fertilize/clones/genes and building stability) is reached via
+        // the small reflection helpers at the bottom of this region. That guarantees the
+        // whole plugin still COMPILES after a Rust update - those actions simply degrade to
+        // a "0 affected" no-op instead of taking the plugin down with a missing member.
+
+        private const string PlotPanelName = "RandomGridSpawn.PlotPanel";
+        private const string FarmPanelName = "RandomGridSpawn.FarmPanel";
+
+        private const string PlotGreen = "0.29 0.48 0.17 1";
+        private const string PlotGold = "0.78 0.6 0.13 1";
+        private const string PlotDark = "0.13 0.13 0.16 1";
+        private const string PlotRed = "0.7 0.26 0.21 1";
+
+        private static readonly string[] PickFruitMethods = { "PickFruit", "PickHarvest", "TakeFruit" };
+        private static readonly string[] TakeCloneMethods = { "TakeClones", "TakeClone", "PickClone" };
+
+        [ChatCommand("plotactions")]
+        private void PlotActionsChatCommand(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !HasNoClipPermission(player))
+                return;
+
+            ShowPlotPanel(player);
+        }
+
+        [ChatCommand("farming")]
+        private void FarmingChatCommand(BasePlayer player, string command, string[] args)
+        {
+            if (player == null || !HasNoClipPermission(player))
+                return;
+
+            ShowFarmPanel(player);
+        }
+
+        [ConsoleCommand("gridspawn.plot")]
+        private void PlotConsoleCommand(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null || !HasNoClipPermission(player))
+                return;
+
+            string action = arg.GetString(0, string.Empty);
+            if (action == "open") { ShowPlotPanel(player); return; }
+            if (action == "close") { CuiHelper.DestroyUi(player, PlotPanelName); return; }
+
+            AssignedArea area;
+            if (!assignedAreas.TryGetValue(player.userID, out area))
+            {
+                PlotToast(player, "You don't have a plot yet.", true);
+                return;
+            }
+
+            switch (action)
+            {
+                case "quicksave":
+                    QuickSave(player);
+                    break;
+                case "tpcenter":
+                    player.Teleport(GetGroundedPosition(area.Center));
+                    PlotToast(player, "Teleported to your plot centre.");
+                    break;
+                case "wipe":
+                    PlotToast(player, WipePlot(area, WipeMode.All) + " entities removed from your plot.");
+                    break;
+                case "wipelevel":
+                    PlotToast(player, WipePlot(area, WipeMode.ToLevel) + " removed (foundations + floors kept).");
+                    break;
+                case "wipefoundations":
+                    PlotToast(player, WipePlot(area, WipeMode.ToFoundations) + " removed (foundations kept).");
+                    break;
+                case "powerall":
+                    PlotToast(player, PowerAll(area) + " electrical entities powered.");
+                    break;
+                case "biome":
+                    // Intentionally does nothing (disabled by request).
+                    PlotToast(player, "Biome changing is disabled on this server.");
+                    break;
+                case "stability":
+                    PlotToast(player, DisableStability(area) + " building blocks set stable.");
+                    break;
+                case "opendoors":
+                    PlotToast(player, SetDoors(area, true) + " doors opened.");
+                    break;
+                case "closedoors":
+                    PlotToast(player, SetDoors(area, false) + " doors closed.");
+                    break;
+                case "deauthtc":
+                    PlotToast(player, DeauthCupboards(area) + " tool cupboards cleared.");
+                    break;
+                case "deauthturret":
+                    PlotToast(player, DeauthTurrets(area) + " turrets cleared.");
+                    break;
+                case "deauthdoor":
+                    PlotToast(player, DeauthDoors(area) + " door locks cleared.");
+                    break;
+            }
+        }
+
+        [ConsoleCommand("gridspawn.farm")]
+        private void FarmConsoleCommand(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.Player();
+            if (player == null || !HasNoClipPermission(player))
+                return;
+
+            string action = arg.GetString(0, string.Empty);
+            if (action == "open") { ShowFarmPanel(player); return; }
+            if (action == "close") { CuiHelper.DestroyUi(player, FarmPanelName); return; }
+
+            AssignedArea area;
+            if (!assignedAreas.TryGetValue(player.userID, out area))
+            {
+                PlotToast(player, "You don't have a plot yet.", true);
+                return;
+            }
+
+            switch (action)
+            {
+                case "grow":
+                    PlotToast(player, GrowPlants(area, false) + " plants advanced.");
+                    break;
+                case "maxgrow":
+                    PlotToast(player, GrowPlants(area, true) + " plants fully grown.");
+                    break;
+                case "harvest":
+                    PlotToast(player, HarvestPlants(area, player) + " plants harvested.");
+                    break;
+                case "water":
+                    PlotToast(player, WaterPlants(area) + " plants watered.");
+                    break;
+                case "fertilize":
+                    PlotToast(player, FertilizePlants(area) + " plants fertilized.");
+                    break;
+                case "heal":
+                    PlotToast(player, HealPlants(area) + " plants healed.");
+                    break;
+                case "clones":
+                    PlotToast(player, TakeClones(area, player) + " clones taken.");
+                    break;
+                case "removeall":
+                    PlotToast(player, RemoveAllPlants(area) + " plants removed.");
+                    break;
+            }
+
+            // Redraw so the plant-status readout reflects the change.
+            ShowFarmPanel(player);
+        }
+
+        private void PlotToast(BasePlayer player, string message, bool error = false)
+        {
+            player.SendConsoleCommand("gametip.showtoast", error ? 1 : 0, message, string.Empty, false);
+        }
+
+        // ---------------- Plot Actions panel ----------------
+
+        private void ShowPlotPanel(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, PlotPanelName);
+
+            CuiElementContainer container = new CuiElementContainer();
+            string panel = container.Add(new CuiPanel
+            {
+                Image = { Color = "0.07 0.07 0.078 0.985" },
+                RectTransform = { AnchorMin = "0.5 0.5", AnchorMax = "0.5 0.5", OffsetMin = "-172 -132", OffsetMax = "172 132" },
+                CursorEnabled = true
+            }, "Overlay", PlotPanelName);
+
+            PanelTitle(container, panel, "PLOT ACTIONS", "gridspawn.plot close");
+
+            PanelHeader(container, panel, "PLOT ACTIONS", -44);
+            MenuButton(container, panel, 12, -58, 158, 30, "QUICK SAVE", "gridspawn.plot quicksave", PlotGreen);
+            MenuButton(container, panel, 174, -58, 158, 30, "TP CENTER PLOT", "gridspawn.plot tpcenter", PlotGreen);
+            MenuButton(container, panel, 12, -92, 102, 30, "WIPE PLOT", "gridspawn.plot wipe", PlotGold);
+            MenuButton(container, panel, 118, -92, 102, 30, "WIPE TO LEVEL", "gridspawn.plot wipelevel", PlotGold);
+            MenuButton(container, panel, 224, -92, 108, 30, "WIPE TO FOUNDATIONS", "gridspawn.plot wipefoundations", PlotGold);
+            MenuButton(container, panel, 12, -126, 102, 30, "POWER ALL", "gridspawn.plot powerall", PlotDark);
+            MenuButton(container, panel, 118, -126, 102, 30, "CHANGE BIOME", "gridspawn.plot biome", PlotDark);
+            MenuButton(container, panel, 224, -126, 108, 30, "DISABLE STABILITY", "gridspawn.plot stability", PlotDark);
+            MenuButton(container, panel, 12, -160, 158, 30, "OPEN DOORS", "gridspawn.plot opendoors", PlotDark);
+            MenuButton(container, panel, 174, -160, 158, 30, "CLOSE DOORS", "gridspawn.plot closedoors", PlotDark);
+
+            PanelHeader(container, panel, "DEAUTH", -198);
+            MenuButton(container, panel, 12, -212, 102, 30, "TCS", "gridspawn.plot deauthtc", PlotDark);
+            MenuButton(container, panel, 118, -212, 102, 30, "TURRETS", "gridspawn.plot deauthturret", PlotDark);
+            MenuButton(container, panel, 224, -212, 108, 30, "DOORS", "gridspawn.plot deauthdoor", PlotDark);
+
+            CuiHelper.AddUi(player, container);
+        }
+
+        // ---------------- Farming panel ----------------
+
+        private void ShowFarmPanel(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, FarmPanelName);
+
+            AssignedArea area;
+            assignedAreas.TryGetValue(player.userID, out area);
+
+            CuiElementContainer container = new CuiElementContainer();
+            string panel = container.Add(new CuiPanel
+            {
+                Image = { Color = "0.07 0.07 0.078 0.985" },
+                RectTransform = { AnchorMin = "0.5 0.5", AnchorMax = "0.5 0.5", OffsetMin = "-172 -168", OffsetMax = "172 168" },
+                CursorEnabled = true
+            }, "Overlay", FarmPanelName);
+
+            PanelTitle(container, panel, "FARMING", "gridspawn.farm close");
+
+            InfoBox(container, panel, -44, 60, "PLANT STATUS", area == null ? "You don't have a plot yet." : PlantStatus(area));
+
+            MenuButton(container, panel, 12, -114, 102, 30, "GROW", "gridspawn.farm grow", PlotDark);
+            MenuButton(container, panel, 118, -114, 102, 30, "MAX GROW", "gridspawn.farm maxgrow", PlotDark);
+            MenuButton(container, panel, 224, -114, 108, 30, "HARVEST", "gridspawn.farm harvest", PlotDark);
+            MenuButton(container, panel, 12, -148, 102, 30, "WATER", "gridspawn.farm water", PlotDark);
+            MenuButton(container, panel, 118, -148, 102, 30, "FERTILIZE", "gridspawn.farm fertilize", PlotDark);
+            MenuButton(container, panel, 224, -148, 108, 30, "HEAL", "gridspawn.farm heal", PlotDark);
+            MenuButton(container, panel, 12, -182, 158, 30, "TAKE CLONES", "gridspawn.farm clones", PlotDark);
+            MenuButton(container, panel, 174, -182, 158, 30, "REMOVE ALL", "gridspawn.farm removeall", PlotRed);
+
+            InfoBox(container, panel, -222, 42, "HELD CLONE INFO", HeldCloneInfo(player));
+
+            List<string> genes = area == null ? new List<string>() : PlotGeneStrings(area);
+            for (int i = 0; i < 4; i++)
+            {
+                string gene = i < genes.Count ? genes[i] : "------";
+                container.Add(new CuiLabel
+                {
+                    Text = { Text = gene, FontSize = 12, Font = "robotocondensed-bold.ttf", Align = TextAnchor.MiddleCenter, Color = GeneColor(gene) },
+                    RectTransform = { AnchorMin = "0 1", AnchorMax = "0 1", OffsetMin = (12 + (i * 82)) + " -300", OffsetMax = (12 + (i * 82) + 78) + " -278" }
+                }, panel);
+            }
+
+            CuiHelper.AddUi(player, container);
+        }
+
+        // ---------------- Shared panel widgets ----------------
+
+        private void PanelTitle(CuiElementContainer container, string parent, string title, string closeCommand)
+        {
+            container.Add(new CuiPanel
+            {
+                Image = { Color = "0.086 0.086 0.09 1" },
+                RectTransform = { AnchorMin = "0 1", AnchorMax = "1 1", OffsetMin = "0 -30", OffsetMax = "0 0" }
+            }, parent);
+
+            container.Add(new CuiLabel
+            {
+                Text = { Text = title, FontSize = 15, Font = "robotocondensed-bold.ttf", Align = TextAnchor.MiddleLeft, Color = "1 1 1 1" },
+                RectTransform = { AnchorMin = "0 1", AnchorMax = "1 1", OffsetMin = "12 -30", OffsetMax = "-40 0" }
+            }, parent);
+
+            container.Add(new CuiButton
+            {
+                Button = { Color = PlotRed, Command = closeCommand },
+                Text = { Text = "X", FontSize = 13, Font = "robotocondensed-bold.ttf", Align = TextAnchor.MiddleCenter, Color = "1 1 1 1" },
+                RectTransform = { AnchorMin = "1 1", AnchorMax = "1 1", OffsetMin = "-30 -28", OffsetMax = "-4 -2" }
+            }, parent);
+        }
+
+        private void PanelHeader(CuiElementContainer container, string parent, string text, int top)
+        {
+            container.Add(new CuiLabel
+            {
+                Text = { Text = text, FontSize = 12, Font = "robotocondensed-bold.ttf", Align = TextAnchor.MiddleCenter, Color = "1 1 1 0.75" },
+                RectTransform = { AnchorMin = "0 1", AnchorMax = "1 1", OffsetMin = "0 " + (top - 16), OffsetMax = "0 " + top }
+            }, parent);
+        }
+
+        private void InfoBox(CuiElementContainer container, string parent, int top, int height, string title, string body)
+        {
+            string box = container.Add(new CuiPanel
+            {
+                Image = { Color = "0 0 0 0.35" },
+                RectTransform = { AnchorMin = "0 1", AnchorMax = "1 1", OffsetMin = "12 " + (top - height), OffsetMax = "-12 " + top }
+            }, parent);
+
+            container.Add(new CuiLabel
+            {
+                Text = { Text = title, FontSize = 11, Font = "robotocondensed-bold.ttf", Align = TextAnchor.UpperCenter, Color = "1 1 1 0.85" },
+                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1", OffsetMin = "0 6", OffsetMax = "0 -6" }
+            }, box);
+
+            container.Add(new CuiLabel
+            {
+                Text = { Text = body, FontSize = 12, Font = "robotocondensed-regular.ttf", Align = TextAnchor.LowerCenter, Color = "1 1 1 0.55" },
+                RectTransform = { AnchorMin = "0 0", AnchorMax = "1 1", OffsetMin = "6 6", OffsetMax = "-6 -6" }
+            }, box);
+        }
+
+        // ---------------- Plot geometry / enumeration ----------------
+
+        private List<T> PlotEntities<T>(AssignedArea area) where T : BaseEntity
+        {
+            List<T> list = new List<T>();
+            foreach (BaseNetworkable networkable in BaseNetworkable.serverEntities)
+            {
+                T entity = networkable as T;
+                if (entity == null || entity.IsDestroyed)
+                    continue;
+                if (!IsInsideArea(entity.transform.position, area))
+                    continue;
+                list.Add(entity);
+            }
+            return list;
+        }
+
+        private enum WipeMode { All, ToLevel, ToFoundations }
+
+        // Full plot clear. ToFoundations keeps foundation blocks; ToLevel keeps foundations
+        // and floors (the ground slab); deployables are always removed. The plot's own map
+        // markers and boundary spheres are never touched.
+        private int WipePlot(AssignedArea area, WipeMode mode)
+        {
+            List<BaseEntity> targets = new List<BaseEntity>();
+            foreach (BaseNetworkable networkable in BaseNetworkable.serverEntities)
+            {
+                BaseEntity entity = networkable as BaseEntity;
+                if (entity == null || entity.IsDestroyed || entity is BasePlayer)
+                    continue;
+                if (entity.OwnerID == 0)
+                    continue; // leave map / monument props alone
+                if (area.Spheres.Contains(entity) || area.MapMarkers.Contains(entity))
+                    continue;
+                if (!IsInsideArea(entity.transform.position, area))
+                    continue;
+
+                BuildingBlock block = entity as BuildingBlock;
+                if (block != null && mode != WipeMode.All)
+                {
+                    string prefab = block.ShortPrefabName;
+                    if (mode == WipeMode.ToFoundations && prefab.StartsWith("foundation"))
+                        continue;
+                    if (mode == WipeMode.ToLevel && (prefab.StartsWith("foundation") || prefab.StartsWith("floor")))
+                        continue;
+                }
+
+                targets.Add(entity);
+            }
+
+            int killed = 0;
+            foreach (BaseEntity entity in targets)
+            {
+                if (entity != null && !entity.IsDestroyed)
+                {
+                    entity.Kill();
+                    killed++;
+                }
+            }
+            return killed;
+        }
+
+        private int PowerAll(AssignedArea area)
+        {
+            int count = 0;
+            foreach (IOEntity io in PlotEntities<IOEntity>(area))
+            {
+                // Reserved8 is the "has power" flag most powered deployables read; On turns
+                // the device on. Best-effort: unwired circuits may recalculate on their next
+                // IO tick, but on a build plot with no real inputs this reads as powered.
+                io.SetFlag(BaseEntity.Flags.Reserved8, true);
+                io.SetFlag(BaseEntity.Flags.On, true);
+                io.SendNetworkUpdate();
+                count++;
+            }
+            return count;
+        }
+
+        private int DisableStability(AssignedArea area)
+        {
+            int count = 0;
+            foreach (BuildingBlock block in PlotEntities<BuildingBlock>(area))
+            {
+                // Marking a block grounded makes the stability system treat it as anchored,
+                // so it won't collapse. Reached by reflection so a renamed field can't break
+                // the plugin's compile.
+                if (SetMember(block, "grounded", true))
+                {
+                    block.SendNetworkUpdate();
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private int SetDoors(AssignedArea area, bool open)
+        {
+            int count = 0;
+            foreach (Door door in PlotEntities<Door>(area))
+            {
+                door.SetOpen(open);
+                count++;
+            }
+            return count;
+        }
+
+        private int DeauthCupboards(AssignedArea area)
+        {
+            int count = 0;
+            foreach (BuildingPrivlidge cupboard in PlotEntities<BuildingPrivlidge>(area))
+            {
+                cupboard.authorizedPlayers.Clear();
+                cupboard.SendNetworkUpdate();
+                count++;
+            }
+            return count;
+        }
+
+        private int DeauthTurrets(AssignedArea area)
+        {
+            int count = 0;
+            foreach (AutoTurret turret in PlotEntities<AutoTurret>(area))
+            {
+                turret.authorizedPlayers.Clear();
+                turret.SendNetworkUpdate();
+                count++;
+            }
+            return count;
+        }
+
+        private int DeauthDoors(AssignedArea area)
+        {
+            int count = 0;
+            foreach (Door door in PlotEntities<Door>(area))
+            {
+                CodeLock codeLock = door.GetSlot(BaseEntity.Slot.Lock) as CodeLock;
+                if (codeLock == null)
+                    continue;
+                codeLock.whitelistPlayers.Clear();
+                codeLock.guestPlayers.Clear();
+                codeLock.SendNetworkUpdate();
+                count++;
+            }
+            return count;
+        }
+
+        // ---------------- Farming ----------------
+
+        private int GrowPlants(AssignedArea area, bool max)
+        {
+            int count = 0;
+            foreach (GrowableEntity plant in PlotEntities<GrowableEntity>(area))
+            {
+                object ageObj = GetMember(plant, "Age") ?? GetMember(plant, "age");
+                if (ageObj is float)
+                {
+                    float newAge = (float)ageObj + (max ? 100000f : 600f);
+                    if (!SetMember(plant, "Age", newAge))
+                        SetMember(plant, "age", newAge);
+                    plant.SendNetworkUpdate();
+                }
+                count++;
+            }
+            return count;
+        }
+
+        private int HealPlants(AssignedArea area)
+        {
+            int count = 0;
+            foreach (GrowableEntity plant in PlotEntities<GrowableEntity>(area))
+            {
+                plant.SetHealth(plant.MaxHealth());
+                plant.SendNetworkUpdate();
+                count++;
+            }
+            return count;
+        }
+
+        private int RemoveAllPlants(AssignedArea area)
+        {
+            List<GrowableEntity> plants = PlotEntities<GrowableEntity>(area);
+            foreach (GrowableEntity plant in plants)
+            {
+                if (!plant.IsDestroyed)
+                    plant.Kill();
+            }
+            return plants.Count;
+        }
+
+        private int HarvestPlants(AssignedArea area, BasePlayer player)
+        {
+            int count = 0;
+            foreach (GrowableEntity plant in PlotEntities<GrowableEntity>(area))
+            {
+                if (CallFirst(plant, PickFruitMethods, player, false) || CallFirst(plant, PickFruitMethods, player))
+                    count++;
+            }
+            return count;
+        }
+
+        private int TakeClones(AssignedArea area, BasePlayer player)
+        {
+            int count = 0;
+            foreach (GrowableEntity plant in PlotEntities<GrowableEntity>(area))
+            {
+                if (CallFirst(plant, TakeCloneMethods, player))
+                    count++;
+            }
+            return count;
+        }
+
+        private int WaterPlants(AssignedArea area)
+        {
+            int count = 0;
+            foreach (GrowableEntity plant in PlotEntities<GrowableEntity>(area))
+            {
+                if (SetMember(plant, "waterCache", 1000f) || SetMember(plant, "currentWater", 1000f) || SetMember(plant, "water", 1000f))
+                {
+                    plant.SendNetworkUpdate();
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private int FertilizePlants(AssignedArea area)
+        {
+            int count = 0;
+            foreach (GrowableEntity plant in PlotEntities<GrowableEntity>(area))
+            {
+                if (SetMember(plant, "Fertilized", true) || SetMember(plant, "fertilized", true) || SetMember(plant, "composterStrength", 1f))
+                {
+                    plant.SendNetworkUpdate();
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private string PlantStatus(AssignedArea area)
+        {
+            List<GrowableEntity> plants = PlotEntities<GrowableEntity>(area);
+            if (plants.Count == 0)
+                return "No plants on plot";
+
+            int ripe = 0;
+            foreach (GrowableEntity plant in plants)
+            {
+                object state = GetMember(plant, "State");
+                if (state != null && state.ToString() == "Fruiting")
+                    ripe++;
+            }
+
+            return plants.Count + (plants.Count == 1 ? " plant" : " plants") + " on plot" + (ripe > 0 ? "   -   " + ripe + " ripe" : string.Empty);
+        }
+
+        private List<string> PlotGeneStrings(AssignedArea area)
+        {
+            List<string> result = new List<string>();
+            foreach (GrowableEntity plant in PlotEntities<GrowableEntity>(area))
+            {
+                result.Add(GeneString(plant));
+                if (result.Count >= 4)
+                    break;
+            }
+            return result;
+        }
+
+        private string GeneString(object plantOrGenes)
+        {
+            object genes = GetMember(plantOrGenes, "Genes") ?? plantOrGenes;
+            System.Collections.IEnumerable slots = GetMember(genes, "Genes") as System.Collections.IEnumerable;
+            if (slots == null)
+                return "------";
+
+            System.Text.StringBuilder builder = new System.Text.StringBuilder();
+            foreach (object slot in slots)
+            {
+                string name = slot == null ? "Empty" : slot.ToString();
+                builder.Append(string.IsNullOrEmpty(name) || name == "Empty" ? '-' : char.ToUpper(name[0]));
+            }
+            return builder.Length == 0 ? "------" : builder.ToString();
+        }
+
+        private string HeldCloneInfo(BasePlayer player)
+        {
+            Item item = player.GetActiveItem();
+            if (item == null || item.info == null)
+                return "Not holding a clone";
+
+            string shortname = item.info.shortname;
+            if (!shortname.StartsWith("clone.") && !shortname.StartsWith("seed."))
+                return "Not holding a clone";
+
+            return shortname.Replace("clone.", string.Empty).Replace("seed.", string.Empty);
+        }
+
+        private string GeneColor(string genes) => "0.75 0.85 0.6 1";
+
+        // ---------------- Reflection helpers (version tolerance) ----------------
+
+        private const BindingFlags PlotMemberFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+        private static object GetMember(object target, string name)
+        {
+            if (target == null)
+                return null;
+
+            Type type = target.GetType();
+            FieldInfo field = type.GetField(name, PlotMemberFlags);
+            if (field != null)
+            {
+                try { return field.GetValue(target); } catch { return null; }
+            }
+
+            PropertyInfo property = type.GetProperty(name, PlotMemberFlags);
+            if (property != null && property.CanRead)
+            {
+                try { return property.GetValue(target); } catch { return null; }
+            }
+
+            return null;
+        }
+
+        private static bool SetMember(object target, string name, object value)
+        {
+            if (target == null)
+                return false;
+
+            Type type = target.GetType();
+            FieldInfo field = type.GetField(name, PlotMemberFlags);
+            if (field != null)
+            {
+                try { field.SetValue(target, value); return true; } catch { return false; }
+            }
+
+            PropertyInfo property = type.GetProperty(name, PlotMemberFlags);
+            if (property != null && property.CanWrite)
+            {
+                try { property.SetValue(target, value); return true; } catch { return false; }
+            }
+
+            return false;
+        }
+
+        private static bool CallFirst(object target, string[] names, params object[] parameters)
+        {
+            if (target == null)
+                return false;
+
+            Type type = target.GetType();
+            foreach (string name in names)
+            {
+                foreach (MethodInfo method in type.GetMethods(PlotMemberFlags))
+                {
+                    if (method.Name != name || method.GetParameters().Length != parameters.Length)
+                        continue;
+
+                    try { method.Invoke(target, parameters); return true; } catch { }
+                }
+            }
+            return false;
+        }
+
+        #endregion
     }
 }
