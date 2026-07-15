@@ -6475,11 +6475,6 @@ namespace Oxide.Plugins
             return true;
         }
 
-        private object OnPayForPlacement(BasePlayer player, Planner planner, Construction construction)
-        {
-            return true;
-        }
-
         private object CanAffordUpgrade(BasePlayer player, BuildingBlock block, BuildingGrade.Enum grade)
         {
             return true;
