@@ -7026,6 +7026,10 @@ namespace Oxide.Plugins
         private static readonly string[] PickFruitMethods = { "PickFruit", "PickHarvest", "TakeFruit" };
         private static readonly string[] TakeCloneMethods = { "TakeClones", "TakeClone", "PickClone" };
 
+        // Gene presets shown as buttons in the Farming panel; clicking one stamps the held
+        // clone/seed with that sequence. G growth, Y yield, H hardiness, W water.
+        private static readonly string[] GenePresets = { "GGGGGG", "YYYYYY", "GGGYYY", "GGGYYY" };
+
         [ChatCommand("plotactions")]
         private void PlotActionsChatCommand(BasePlayer player, string command, string[] args)
         {
@@ -7118,6 +7122,14 @@ namespace Oxide.Plugins
             string action = arg.GetString(0, string.Empty);
             if (action == "open") { ShowFarmPanel(player); return; }
             if (action == "close") { CuiHelper.DestroyUi(player, FarmPanelName); return; }
+
+            // Acts on the held clone/seed, not the plot, so it doesn't require plot ownership.
+            if (action == "setgenes")
+            {
+                SetHeldCloneGenes(player, arg.GetString(1, string.Empty));
+                ShowFarmPanel(player);
+                return;
+            }
 
             AssignedArea area;
             if (!assignedAreas.TryGetValue(player.userID, out area))
@@ -7231,12 +7243,15 @@ namespace Oxide.Plugins
 
             InfoBox(container, panel, -222, 42, "HELD CLONE INFO", HeldCloneInfo(player));
 
-            List<string> genes = area == null ? new List<string>() : PlotGeneStrings(area);
-            for (int i = 0; i < 4; i++)
+            // Clicking a preset writes that gene sequence onto the clone/seed the player is
+            // holding (see gridspawn.farm setgenes). Fixed presets rather than the plot's own
+            // plants so the buttons are a stable palette to stamp held clones with.
+            for (int i = 0; i < GenePresets.Length; i++)
             {
-                string gene = i < genes.Count ? genes[i] : "------";
-                container.Add(new CuiLabel
+                string gene = GenePresets[i];
+                container.Add(new CuiButton
                 {
+                    Button = { Color = PlotDark, Command = "gridspawn.farm setgenes " + gene },
                     Text = { Text = gene, FontSize = 12, Font = "robotocondensed-bold.ttf", Align = TextAnchor.MiddleCenter, Color = GeneColor(gene) },
                     RectTransform = { AnchorMin = "0 1", AnchorMax = "0 1", OffsetMin = (12 + (i * 82)) + " -300", OffsetMax = (12 + (i * 82) + 78) + " -278" }
                 }, panel);
@@ -7597,6 +7612,160 @@ namespace Oxide.Plugins
         }
 
         private string GeneColor(string genes) => "0.75 0.85 0.6 1";
+
+        // Stamp the held clone/seed with a gene sequence (e.g. "GGGYYY"). Called from the
+        // Farming panel's gene buttons.
+        private void SetHeldCloneGenes(BasePlayer player, string geneString)
+        {
+            Item item = player.GetActiveItem();
+            string shortname = item != null && item.info != null ? item.info.shortname : string.Empty;
+            if (string.IsNullOrEmpty(shortname) || (!shortname.StartsWith("clone.") && !shortname.StartsWith("seed.")))
+            {
+                PlotToast(player, "Hold a clone or seed to set its genes.", true);
+                return;
+            }
+
+            if (string.IsNullOrEmpty(geneString))
+            {
+                PlotToast(player, "No gene sequence provided.", true);
+                return;
+            }
+
+            geneString = geneString.ToUpper();
+            if (SetItemGenes(item, geneString))
+                PlotToast(player, "Set genes to " + geneString + ".");
+            else
+                PlotToast(player, "Couldn't set genes on this item.", true);
+        }
+
+        // Writes the encoded gene sequence into the item's instance data. Reached entirely by
+        // reflection/shape-matching so a Rust rename degrades to a no-op instead of breaking
+        // the plugin's compile (same philosophy as the other farming actions).
+        private bool SetItemGenes(Item item, string geneString)
+        {
+            try
+            {
+                Type genesType = typeof(GrowableEntity).Assembly.GetType("GrowableGenes");
+                Type encodingType = typeof(GrowableEntity).Assembly.GetType("GrowableGeneEncoding");
+                if (genesType == null || encodingType == null)
+                    return false;
+
+                object genes = Activator.CreateInstance(genesType);
+
+                // Locate the gene-slot array (GrowableGene[] or GeneType[]).
+                FieldInfo arrayField = genesType.GetField("Genes", PlotMemberFlags);
+                if (arrayField == null || !arrayField.FieldType.IsArray)
+                {
+                    arrayField = null;
+                    foreach (FieldInfo field in genesType.GetFields(PlotMemberFlags))
+                    {
+                        if (field.FieldType.IsArray)
+                        {
+                            arrayField = field;
+                            break;
+                        }
+                    }
+                }
+                if (arrayField == null)
+                    return false;
+
+                Type elementType = arrayField.FieldType.GetElementType();
+
+                // Respect the game's slot count if it pre-allocated the array.
+                int length = 6;
+                object existing = arrayField.GetValue(genes);
+                Array existingArray = existing as Array;
+                if (existingArray != null && existingArray.Length > 0)
+                    length = existingArray.Length;
+
+                Array slots = Array.CreateInstance(elementType, length);
+                for (int i = 0; i < length; i++)
+                {
+                    char c = i < geneString.Length ? geneString[i] : '-';
+                    slots.SetValue(BuildGeneSlot(elementType, c), i);
+                }
+                arrayField.SetValue(genes, slots);
+
+                // Discover the encoder by shape: a static int method taking one GrowableGenes.
+                int encoded = 0;
+                bool encodedOk = false;
+                foreach (MethodInfo method in encodingType.GetMethods(BindingFlags.Public | BindingFlags.Static))
+                {
+                    ParameterInfo[] parameters = method.GetParameters();
+                    if (method.ReturnType == typeof(int) && parameters.Length == 1 && parameters[0].ParameterType.IsAssignableFrom(genesType))
+                    {
+                        encoded = (int)method.Invoke(null, new[] { genes });
+                        encodedOk = true;
+                        break;
+                    }
+                }
+                if (!encodedOk)
+                    return false;
+
+                FieldInfo instanceField = typeof(Item).GetField("instanceData", PlotMemberFlags);
+                if (instanceField == null)
+                    return false;
+
+                object instance = instanceField.GetValue(item);
+                if (instance == null)
+                {
+                    instance = Activator.CreateInstance(instanceField.FieldType);
+                    instanceField.SetValue(item, instance);
+                }
+
+                // Keep the instance data from being pooled back out from under us.
+                SetMember(instance, "ShouldPool", false);
+                if (!SetMember(instance, "dataInt", encoded))
+                    return false;
+
+                item.MarkDirty();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Builds one gene slot for a target char. Slot is either the GeneType enum directly or
+        // a struct wrapping it; either way the gene type is chosen by first letter (G growth,
+        // Y yield, H hardiness, W water, else Empty) - the convention GeneString() reads back.
+        private object BuildGeneSlot(Type elementType, char c)
+        {
+            if (elementType.IsEnum)
+                return GeneEnumValue(elementType, c);
+
+            object slot = Activator.CreateInstance(elementType);
+            foreach (FieldInfo field in elementType.GetFields(PlotMemberFlags))
+            {
+                if (field.FieldType.IsEnum)
+                {
+                    field.SetValue(slot, GeneEnumValue(field.FieldType, c));
+                    break;
+                }
+            }
+            return slot;
+        }
+
+        private object GeneEnumValue(Type enumType, char c)
+        {
+            char target = char.ToUpper(c);
+            foreach (string name in Enum.GetNames(enumType))
+            {
+                if (name.Length > 0 && char.ToUpper(name[0]) == target)
+                    return Enum.Parse(enumType, name);
+            }
+
+            // Anything unrecognised falls back to the Empty slot (name starting with 'E').
+            foreach (string name in Enum.GetNames(enumType))
+            {
+                if (name.Length > 0 && char.ToUpper(name[0]) == 'E')
+                    return Enum.Parse(enumType, name);
+            }
+
+            Array values = Enum.GetValues(enumType);
+            return values.Length > 0 ? values.GetValue(0) : Activator.CreateInstance(enumType);
+        }
 
         // ---------------- Reflection helpers (version tolerance) ----------------
 
